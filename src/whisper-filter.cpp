@@ -9,6 +9,7 @@
  */
 
 #include "whisper-context.h"
+#include "window-slicer.h"
 #include "caption-writer.h"
 
 #include <obs-module.h>
@@ -229,7 +230,8 @@ static void worker_run(whisper_filter *f)
 					       f->whisper.model_path() ||
 				       (f->whisper.loaded() &&
 					f->use_gpu != f->loaded_gpu) ||
-				       f->buffer.size() >= f->window_samples;
+				       whisper_next_window(f->buffer,
+							   f->window_samples) > 0;
 			});
 
 			if (!f->running)
@@ -248,15 +250,18 @@ static void worker_run(whisper_filter *f)
 				f->reopen_output = false;
 			}
 
-			if (f->buffer.size() >= f->window_samples) {
+			/* Cut the next window at a pause near the configured
+			 * length instead of at a blind sample offset, so words
+			 * aren't split across the boundary. */
+			const size_t cut = whisper_next_window(f->buffer,
+							       f->window_samples);
+			if (cut > 0) {
 				window.assign(f->buffer.begin(),
-					      f->buffer.begin() +
-						      f->window_samples);
+					      f->buffer.begin() + cut);
 				f->buffer.erase(f->buffer.begin(),
-						f->buffer.begin() +
-							f->window_samples);
+						f->buffer.begin() + cut);
 				base_samples = f->consumed_samples;
-				f->consumed_samples += f->window_samples;
+				f->consumed_samples += cut;
 			}
 		}
 

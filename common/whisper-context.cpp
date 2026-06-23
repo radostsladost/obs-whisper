@@ -1,6 +1,7 @@
 #include "whisper-context.h"
+#include "whisper-log.h"
 
-#include <obs-module.h>
+#include <ggml.h>
 #include <whisper.h>
 
 #include <algorithm>
@@ -18,6 +19,17 @@
  * when two instances initialize the GPU backend at the same time).
  */
 static std::mutex g_whisper_global_mutex;
+
+static void whisper_silent_log(enum ggml_log_level, const char *, void *) {}
+
+void whisper_set_native_logging(bool verbose)
+{
+	if (verbose)
+		return; /* keep whisper.cpp / ggml default stderr logging */
+
+	whisper_log_set(whisper_silent_log, nullptr);
+	ggml_log_set(whisper_silent_log, nullptr);
+}
 
 /* Lowercase an UTF-8 string for ASCII and the Russian Cyrillic range so that
  * hallucination matching is case-insensitive for the languages we care about. */
@@ -137,13 +149,13 @@ bool WhisperContext::load(const std::string &model_path, bool use_gpu)
 	std::lock_guard<std::mutex> lk(g_whisper_global_mutex);
 	ctx = whisper_init_from_file_with_params(model_path.c_str(), cparams);
 	if (!ctx) {
-		blog(LOG_ERROR, "[obs-whisper] failed to load model: %s",
+		wlog(WLOG_ERROR, "[whisper] failed to load model: %s",
 		     model_path.c_str());
 		return false;
 	}
 
 	loaded_path = model_path;
-	blog(LOG_INFO, "[obs-whisper] loaded model: %s", model_path.c_str());
+	wlog(WLOG_INFO, "[whisper] loaded model: %s", model_path.c_str());
 	return true;
 }
 
@@ -184,20 +196,23 @@ bool WhisperContext::transcribe(const std::vector<float> &samples,
 	wparams.n_threads = std::max(1, n_threads);
 
 	const bool auto_detect = language.empty() || language == "auto";
-	/* whisper.cpp uses the literal "auto" plus detect_language for detection. */
+	/* Set language to "auto" so whisper.cpp auto-detects it, or to a specific
+	 * ISO code. detect_language MUST stay false: when true, whisper.cpp only
+	 * runs language detection and returns *without transcribing* (which would
+	 * yield zero segments). "auto" already triggers detection followed by
+	 * normal transcription. */
 	if (!auto_detect && whisper_lang_id(language.c_str()) < 0) {
-		blog(LOG_WARNING,
-		     "[obs-whisper] unknown language code '%s', using auto-detect",
+		wlog(WLOG_WARNING,
+		     "[whisper] unknown language code '%s', using auto-detect",
 		     language.c_str());
 		wparams.language = "auto";
-		wparams.detect_language = true;
 	} else {
 		wparams.language = auto_detect ? "auto" : language.c_str();
-		wparams.detect_language = auto_detect;
 	}
+	wparams.detect_language = false;
 
-	blog(LOG_INFO,
-	     "[obs-whisper] whisper params: language='%s' detect=%d translate=%d",
+	wlog(WLOG_INFO,
+	     "[whisper] whisper params: language='%s' detect=%d translate=%d",
 	     wparams.language ? wparams.language : "(null)",
 	     (int)wparams.detect_language, (int)wparams.translate);
 
@@ -207,12 +222,12 @@ bool WhisperContext::transcribe(const std::vector<float> &samples,
 
 	if (whisper_full(ctx, wparams, samples.data(), (int)samples.size()) !=
 	    0) {
-		blog(LOG_ERROR, "[obs-whisper] whisper_full() failed");
+		wlog(WLOG_ERROR, "[whisper] whisper_full() failed");
 		return false;
 	}
 
 	const int lang_id = whisper_full_lang_id(ctx);
-	blog(LOG_INFO, "[obs-whisper] detected/used language: %s",
+	wlog(WLOG_INFO, "[whisper] detected/used language: %s",
 	     lang_id >= 0 ? whisper_lang_str(lang_id) : "(unknown)");
 
 	const int n_segments = whisper_full_n_segments(ctx);
@@ -221,8 +236,8 @@ bool WhisperContext::transcribe(const std::vector<float> &samples,
 		 * removes most "thank you for watching"-style hallucinations. */
 		const float nsp = whisper_full_get_segment_no_speech_prob(ctx, i);
 		if (nsp > 0.6f) {
-			blog(LOG_INFO,
-			     "[obs-whisper] dropping non-speech segment (p=%.2f)",
+			wlog(WLOG_INFO,
+			     "[whisper] dropping non-speech segment (p=%.2f)",
 			     nsp);
 			continue;
 		}
@@ -251,8 +266,7 @@ bool WhisperContext::transcribe(const std::vector<float> &samples,
 
 		/* Drop bracketed non-speech annotations like "[clicking]". */
 		if (is_non_speech_annotation(seg.text)) {
-			blog(LOG_INFO,
-			     "[obs-whisper] dropping annotation: %s",
+			wlog(WLOG_INFO, "[whisper] dropping annotation: %s",
 			     seg.text.c_str());
 			continue;
 		}
@@ -260,8 +274,7 @@ bool WhisperContext::transcribe(const std::vector<float> &samples,
 		/* Drop well-known silence hallucinations ("Спасибо за
 		 * внимание!", "Пока!", "Thanks for watching!", ...). */
 		if (is_hallucination_phrase(seg.text)) {
-			blog(LOG_INFO,
-			     "[obs-whisper] dropping hallucination: %s",
+			wlog(WLOG_INFO, "[whisper] dropping hallucination: %s",
 			     seg.text.c_str());
 			continue;
 		}

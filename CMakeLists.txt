@@ -1,39 +1,38 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(obs-whisper VERSION 1.0.0)
+project(obs-whisper VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
+# Emit compile_commands.json so editors / language servers (clangd) can resolve
+# include paths for all three components.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# The plugin is a shared module, so every static library we link into it
-# (whisper.cpp + ggml) must be compiled as position-independent code.
+# Static libraries (whisper.cpp + ggml + our common lib) get linked into a
+# shared OBS module, so everything must be position-independent.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
-# libobs
+# What to build
 #
-# Provide OBS development files however your platform exposes them, e.g.:
-#   -Dlibobs_DIR=/path/to/obs-studio/build/libobs   (build tree), or
-#   the system package on Linux (libobs-dev).
+# Both consumers share the same whisper core in common/. Each is optional and
+# only built when its dependencies are available, so you can build just the CLI
+# on a machine without OBS, or just the plugin without Qt.
 # ---------------------------------------------------------------------------
-find_package(libobs REQUIRED)
+option(BUILD_OBS_PLUGIN "Build the OBS Studio plugin" ON)
+option(BUILD_CLI "Build the standalone Qt CLI transcriber" ON)
 
 # ---------------------------------------------------------------------------
-# GPU acceleration (optional)
+# GPU acceleration (optional) — applies to both the plugin and the CLI.
 #
-# whisper.cpp builds CPU-only by default. Enable one of these to use the GPU:
-#
-#   -DWHISPER_CUDA=ON    NVIDIA, best performance. Requires the CUDA toolkit
-#                        (nvcc) matching your GPU (RTX 50-series needs CUDA 12.8+).
-#   -DWHISPER_VULKAN=ON  Any GPU. Requires Vulkan headers/loader and a shader
-#                        compiler (glslc, from the shaderc/glslc package).
-#
-# The plugin's "Use GPU" toggle only has an effect when one of these is built in.
+#   -DWHISPER_CUDA=ON    NVIDIA, best performance. Requires the CUDA toolkit.
+#   -DWHISPER_VULKAN=ON  Any GPU. Requires Vulkan headers/loader + glslc.
 # ---------------------------------------------------------------------------
 option(WHISPER_CUDA "Build whisper.cpp with CUDA (NVIDIA) GPU support" OFF)
 option(WHISPER_VULKAN "Build whisper.cpp with Vulkan GPU support" OFF)
@@ -78,45 +77,34 @@ foreach(_whisper_tgt whisper ggml ggml-base ggml-cpu ggml-cuda ggml-vulkan)
 endforeach()
 
 # ---------------------------------------------------------------------------
-# The plugin module
+# Shared whisper core (used by both the plugin and the CLI)
 # ---------------------------------------------------------------------------
-add_library(${PROJECT_NAME} MODULE
-  src/plugin-main.c
-  src/whisper-filter.cpp
-  src/whisper-context.cpp
-  src/caption-writer.cpp
-)
-
-target_compile_definitions(${PROJECT_NAME}
-  PRIVATE PLUGIN_VERSION="${PROJECT_VERSION}")
-
-target_link_libraries(${PROJECT_NAME}
-  PRIVATE
-    OBS::libobs
-    whisper
-)
-
-set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")
+add_subdirectory(common)
 
 # ---------------------------------------------------------------------------
-# Install
-#
-# Adjust OBS_PLUGIN_DESTINATION / OBS_DATA_DESTINATION for your platform.
-# Linux example below installs into the per-user OBS plugin directory.
+# OBS Studio plugin (optional)
 # ---------------------------------------------------------------------------
-if(NOT DEFINED OBS_PLUGIN_DESTINATION)
-  if(WIN32)
-    set(OBS_PLUGIN_DESTINATION "obs-plugins/64bit")
-    set(OBS_DATA_DESTINATION "data/obs-plugins/${PROJECT_NAME}")
+if(BUILD_OBS_PLUGIN)
+  find_package(libobs QUIET)
+  if(libobs_FOUND)
+    add_subdirectory(src)
   else()
-    set(OBS_PLUGIN_DESTINATION "$ENV{HOME}/.config/obs-studio/plugins/${PROJECT_NAME}/bin/64bit")
-    set(OBS_DATA_DESTINATION "$ENV{HOME}/.config/obs-studio/plugins/${PROJECT_NAME}/data")
+    message(WARNING
+      "BUILD_OBS_PLUGIN is ON but libobs was not found; skipping the OBS plugin. "
+      "Point CMake at your OBS dev files with -Dlibobs_DIR=...")
   endif()
 endif()
 
-install(TARGETS ${PROJECT_NAME}
-  LIBRARY DESTINATION "${OBS_PLUGIN_DESTINATION}"
-  RUNTIME DESTINATION "${OBS_PLUGIN_DESTINATION}")
-
-install(DIRECTORY data/
-  DESTINATION "${OBS_DATA_DESTINATION}")
+# ---------------------------------------------------------------------------
+# Standalone Qt CLI (optional)
+# ---------------------------------------------------------------------------
+if(BUILD_CLI)
+  find_package(Qt6 QUIET COMPONENTS Core Multimedia)
+  if(Qt6_FOUND)
+    add_subdirectory(cli)
+  else()
+    message(WARNING
+      "BUILD_CLI is ON but Qt6 (Core + Multimedia) was not found; skipping the CLI. "
+      "Install the Qt 6 Multimedia development packages to enable it.")
+  endif()
+endif()

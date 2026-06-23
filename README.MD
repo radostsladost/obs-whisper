@@ -1,9 +1,20 @@
 # obs-whisper
 
-An [OBS Studio](https://obsproject.com/) audio filter that transcribes a
-source's audio locally with [Whisper](https://github.com/openai/whisper) (via
-[whisper.cpp](https://github.com/ggerganov/whisper.cpp)) and saves the captions
-to a plain text file.
+Local, offline speech-to-text with [Whisper](https://github.com/openai/whisper)
+(via [whisper.cpp](https://github.com/ggerganov/whisper.cpp)). The repository
+builds two front-ends that share one transcription core:
+
+- **`obs-whisper`** — an [OBS Studio](https://obsproject.com/) audio filter that
+  transcribes a source's audio and saves the captions to a text file.
+- **`whisper-cli`** — a standalone Qt command-line tool that enumerates the
+  system's audio input devices, transcribes them, and prints the text to
+  stdout.
+
+Both link against the **`whisper-common`** static library, so the model
+handling, inference parameters and hallucination/silence filtering live in
+exactly one place (`common/`).
+
+## The OBS filter
 
 It does three things:
 
@@ -37,12 +48,17 @@ latency and memory stay bounded.
 
 ## Requirements
 
-- OBS Studio **28+** development files (`libobs`).
 - A C++17 compiler and CMake **3.16+**.
 - A Whisper model in `ggml`/`gguf` format, e.g. `ggml-base.en.bin`. Download one
   from the [whisper.cpp models page](https://huggingface.co/ggerganov/whisper.cpp).
+- For the **OBS filter**: OBS Studio **28+** development files (`libobs`).
+- For the **CLI**: Qt 6 with the Multimedia module (`qt6-multimedia-dev` on
+  Debian/Ubuntu).
 
-`whisper.cpp` itself is fetched and built automatically by CMake.
+`whisper.cpp` itself is fetched and built automatically by CMake. Each
+front-end is optional: if `libobs` is missing the plugin is skipped, and if Qt 6
+Multimedia is missing the CLI is skipped (a status message says which). You can
+also toggle them explicitly with `-DBUILD_OBS_PLUGIN=OFF` / `-DBUILD_CLI=OFF`.
 
 ## Building
 
@@ -111,6 +127,8 @@ cmake --install build --prefix /where/obs/lives \
 
 ## Usage
 
+### OBS filter
+
 1. Start OBS. In any audio source, click the gear → **Filters**.
 2. Under **Audio/Video Filters**, add **Whisper Captions**.
 3. Configure:
@@ -135,11 +153,64 @@ With timestamps enabled:
 [00:00:03.480 --> 00:00:07.200] Today we're going to build an OBS plugin.
 ```
 
+### Command-line (`whisper-cli`)
+
+The CLI captures live audio input devices and prints transcripts to stdout.
+By default it is quiet — only the transcribed text goes to stdout and nothing
+else. Pass `--verbose` to see diagnostics (model loading, per-window audio
+levels, whisper/ggml/Qt logs) on stderr.
+
+List the available input devices:
+
+```sh
+./build/cli/whisper-cli --list
+```
+
+Transcribe **all** input devices (the default) with a model:
+
+```sh
+./build/cli/whisper-cli --model /path/to/ggml-base.en.bin
+```
+
+Each output line is tagged with the device it came from:
+
+```
+[Microphone (USB Audio)] Hello and welcome to the stream.
+[Desktop Audio] Today we're going to build an OBS plugin.
+```
+
+Useful options (see `--help` for the full list):
+
+| Option              | Meaning                                                  |
+| ------------------- | -------------------------------------------------------- |
+| `--model <path>`    | Whisper `ggml`/`gguf` model (required unless `--list`).  |
+| `--list`            | List input devices and exit.                             |
+| `--device <match>`  | Only capture devices whose name contains `<match>` (case-insensitive). Repeatable; default is every device. |
+| `--language <code>` | Language code (e.g. `en`, `ru`) or `auto` (default).     |
+| `--translate`       | Translate the transcription to English.                  |
+| `--timestamps`      | Prefix each line with `[start --> end]`.                 |
+| `--window <sec>`    | Transcription window length, 1–30 s (default 10).        |
+| `--threads <n>`     | Inference threads (default: auto).                       |
+| `--gpu`             | Use the GPU (only if built with CUDA/Vulkan).            |
+| `--verbose`, `-v`   | Print diagnostics to stderr (off by default).            |
+
+Example — only the USB mic, in Russian, translated to English, with timestamps:
+
+```sh
+./build/cli/whisper-cli --model ggml-base.bin \
+  --device USB --language ru --translate --timestamps
+```
+
+Press **Ctrl-C** to stop. Because output is line-buffered on stdout, you can
+pipe it straight into other tools, e.g. `whisper-cli --model ... | tee log.txt`.
+
 ## Notes & limitations
 
-- Captions are produced in fixed windows, so a word spoken across a window
-  boundary may occasionally be split. Increase the window length if this is
-  noticeable.
+- Captions are produced in rolling windows. To avoid splitting a word across a
+  window boundary, each window is cut at a short pause near the configured
+  length rather than at an exact time offset, so the boundary lands between
+  words. If you speak continuously with no pause for longer than the window,
+  a cut is still forced to keep latency bounded.
 - Larger models (`small`, `medium`, `large`) are more accurate but need more
   CPU/GPU and memory. Start with `base.en` for English.
 - This writes captions to a file; it does not push live captions into the
@@ -147,10 +218,15 @@ With timestamps enabled:
 
 ## Project layout
 
-| Path                       | Purpose                                        |
-| -------------------------- | ---------------------------------------------- |
-| `src/plugin-main.c`        | OBS module entry point / registration          |
-| `src/whisper-filter.cpp`   | Audio filter, resampling, worker thread, output |
-| `src/whisper-context.*`    | whisper.cpp model wrapper                       |
-| `data/locale/en-US.ini`    | UI strings                                      |
-| `CMakeLists.txt`           | Build (fetches whisper.cpp)                     |
+| Path                         | Purpose                                          |
+| ---------------------------- | ------------------------------------------------ |
+| `common/whisper-context.*`   | Shared whisper.cpp model wrapper + filtering      |
+| `common/whisper-log.*`       | Logging shim (stderr by default; host-overridable) |
+| `src/plugin-main.c`          | OBS module entry point / registration            |
+| `src/whisper-filter.cpp`     | Audio filter, resampling, worker thread, output  |
+| `src/caption-writer.*`       | Shared caption file sink                          |
+| `cli/main.cpp`               | CLI entry point, argument parsing, device select |
+| `cli/device-capture.*`       | Qt audio capture + resampling per device         |
+| `cli/transcription-engine.*` | Shared model + worker thread, prints to stdout   |
+| `data/locale/en-US.ini`      | OBS UI strings                                    |
+| `CMakeLists.txt`             | Top-level build (fetches whisper.cpp)            |

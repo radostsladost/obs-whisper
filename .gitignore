@@ -7,3 +7,4 @@ build*/
 *.dylib
 .cache/
 .DS_Store
+/compile_commands.json

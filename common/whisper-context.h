@@ -12,6 +12,11 @@
 
 struct whisper_context;
 
+/* Control whisper.cpp's and ggml's own (very chatty) logging. When `verbose`
+ * is false, both are silenced; when true, their default stderr logging is kept.
+ * Affects the whole process; call once before loading a model. */
+void whisper_set_native_logging(bool verbose);
+
 /* One transcribed segment with start/end times in milliseconds (relative to
  * the start of the audio buffer that was passed to transcribe()). */
 struct WhisperSegment {
