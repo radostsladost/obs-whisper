@@ -84,6 +84,7 @@ add_library(${PROJECT_NAME} MODULE
   src/plugin-main.c
   src/whisper-filter.cpp
   src/whisper-context.cpp
+  src/caption-writer.cpp
 )
 
 target_compile_definitions(${PROJECT_NAME}

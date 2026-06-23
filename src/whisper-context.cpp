@@ -4,7 +4,95 @@
 #include <whisper.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <string>
+
+/*
+ * The ggml GPU backends (Vulkan/CUDA) share global device state whose
+ * initialization is not thread-safe. With one filter instance per audio device,
+ * multiple worker threads can call into whisper.cpp concurrently. Serialize all
+ * model load/unload/inference across instances to avoid races (notably a crash
+ * when two instances initialize the GPU backend at the same time).
+ */
+static std::mutex g_whisper_global_mutex;
+
+/* Lowercase an UTF-8 string for ASCII and the Russian Cyrillic range so that
+ * hallucination matching is case-insensitive for the languages we care about. */
+static std::string utf8_lower(const std::string &s)
+{
+	std::string out;
+	out.reserve(s.size());
+	for (size_t i = 0; i < s.size();) {
+		const unsigned char c = (unsigned char)s[i];
+		if (c < 0x80) {
+			out += (char)std::tolower(c);
+			++i;
+		} else if ((c & 0xE0) == 0xC0 && i + 1 < s.size()) {
+			unsigned cp = ((c & 0x1F) << 6) |
+				      ((unsigned char)s[i + 1] & 0x3F);
+			if (cp >= 0x0410 && cp <= 0x042F) /* А-Я -> а-я */
+				cp += 0x20;
+			else if (cp == 0x0401) /* Ё -> ё */
+				cp = 0x0451;
+			out += (char)(0xC0 | (cp >> 6));
+			out += (char)(0x80 | (cp & 0x3F));
+			i += 2;
+		} else {
+			out += s[i];
+			++i;
+		}
+	}
+	return out;
+}
+
+/* Returns true if `text` is one of Whisper's well-known hallucinations that it
+ * emits on silence or background noise ("Thanks for watching!", "Спасибо за
+ * внимание!", "Пока!", ...). Compared case-insensitively after stripping
+ * surrounding punctuation and whitespace. */
+static bool is_hallucination_phrase(const std::string &text)
+{
+	/* Strip leading/trailing whitespace and punctuation the model tends to
+	 * append to these stock phrases. */
+	static const char *kStrip = " \t\r\n.!?,;:\"'\u2026\u00ab\u00bb-";
+	size_t start = text.find_first_not_of(kStrip);
+	if (start == std::string::npos)
+		return true; /* punctuation/whitespace only */
+	size_t end = text.find_last_not_of(kStrip);
+	const std::string core =
+		utf8_lower(text.substr(start, end - start + 1));
+
+	static const std::set<std::string> kPhrases = {
+		/* Russian */
+		"спасибо за внимание",
+		"спасибо за просмотр",
+		"спасибо",
+		"пока",
+		"пока пока",
+		"продолжение следует",
+		"до новых встреч",
+		"подписывайтесь на канал",
+		"субтитры сделал dimatorzok",
+		"субтитры создавал dimatorzok",
+		/* English */
+		"thank you",
+		"thank you.",
+		"thanks for watching",
+		"thank you for watching",
+		"please subscribe",
+		"subscribe to my channel",
+		"bye",
+		"bye bye",
+		"you",
+		/* Other common ones */
+		"ご視聴ありがとうございました",
+		"\u0936\u0941\u0915\u094d\u0930\u093f\u092f\u093e",
+	};
+
+	return kPhrases.count(core) > 0;
+}
 
 /* Returns true if the (already-trimmed) text is a non-speech annotation that
  * Whisper sometimes emits on noise, e.g. "[clicking]", "(music)", "*counting*".
@@ -46,6 +134,7 @@ bool WhisperContext::load(const std::string &model_path, bool use_gpu)
 		whisper_context_default_params();
 	cparams.use_gpu = use_gpu;
 
+	std::lock_guard<std::mutex> lk(g_whisper_global_mutex);
 	ctx = whisper_init_from_file_with_params(model_path.c_str(), cparams);
 	if (!ctx) {
 		blog(LOG_ERROR, "[obs-whisper] failed to load model: %s",
@@ -61,6 +150,7 @@ bool WhisperContext::load(const std::string &model_path, bool use_gpu)
 void WhisperContext::unload()
 {
 	if (ctx) {
+		std::lock_guard<std::mutex> lk(g_whisper_global_mutex);
 		whisper_free(ctx);
 		ctx = nullptr;
 	}
@@ -111,6 +201,10 @@ bool WhisperContext::transcribe(const std::vector<float> &samples,
 	     wparams.language ? wparams.language : "(null)",
 	     (int)wparams.detect_language, (int)wparams.translate);
 
+	/* Serialize inference: the shared GPU backend is not safe for concurrent
+	 * use across instances. */
+	std::lock_guard<std::mutex> lk(g_whisper_global_mutex);
+
 	if (whisper_full(ctx, wparams, samples.data(), (int)samples.size()) !=
 	    0) {
 		blog(LOG_ERROR, "[obs-whisper] whisper_full() failed");
@@ -159,6 +253,15 @@ bool WhisperContext::transcribe(const std::vector<float> &samples,
 		if (is_non_speech_annotation(seg.text)) {
 			blog(LOG_INFO,
 			     "[obs-whisper] dropping annotation: %s",
+			     seg.text.c_str());
+			continue;
+		}
+
+		/* Drop well-known silence hallucinations ("Спасибо за
+		 * внимание!", "Пока!", "Thanks for watching!", ...). */
+		if (is_hallucination_phrase(seg.text)) {
+			blog(LOG_INFO,
+			     "[obs-whisper] dropping hallucination: %s",
 			     seg.text.c_str());
 			continue;
 		}

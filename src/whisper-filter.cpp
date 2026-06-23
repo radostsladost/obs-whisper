@@ -9,18 +9,20 @@
  */
 
 #include "whisper-context.h"
+#include "caption-writer.h"
 
 #include <obs-module.h>
 
 #include <condition_variable>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 /* Whisper always expects 16 kHz mono audio. */
 static constexpr uint32_t WHISPER_SR = 16000;
@@ -33,9 +35,15 @@ static constexpr uint32_t WHISPER_SR = 16000;
 #define S_USE_GPU "use_gpu"
 #define S_TIMESTAMPS "save_timestamps"
 #define S_WINDOW_SEC "window_seconds"
+#define S_LABEL_SOURCE "label_source"
 
 struct whisper_filter {
 	obs_source_t *context = nullptr;
+
+	/* Wall-clock time (ms since epoch) when the filter was created, used to
+	 * produce absolute timestamps that line up across multiple devices
+	 * writing to the same file. */
+	int64_t start_walltime_ms = 0;
 
 	/* Source sample rate; audio is downmixed + resampled to 16 kHz mono. */
 	uint32_t in_sample_rate = 48000;
@@ -66,12 +74,13 @@ struct whisper_filter {
 	bool use_gpu = true;
 	bool save_timestamps = true;
 	size_t window_samples = WHISPER_SR * 10;
+	bool label_source = true;
 	bool reopen_output = false;
 
 	/* Worker-thread-only state. */
 	WhisperContext whisper;
 	bool loaded_gpu = true; /* GPU setting the current model was loaded with */
-	std::ofstream out_file;
+	std::shared_ptr<CaptionSink> sink;
 	std::string open_output_path;
 };
 
@@ -79,72 +88,80 @@ struct whisper_filter {
 /* Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
-static std::string format_timestamp(int64_t ms)
+/* Format a wall-clock instant (ms since epoch) as local time of day. */
+static std::string format_walltime(int64_t epoch_ms)
 {
-	if (ms < 0)
-		ms = 0;
-	int64_t h = ms / 3600000;
-	ms %= 3600000;
-	int64_t m = ms / 60000;
-	ms %= 60000;
-	int64_t s = ms / 1000;
-	ms %= 1000;
+	if (epoch_ms < 0)
+		epoch_ms = 0;
+	time_t secs = (time_t)(epoch_ms / 1000);
+	int ms = (int)(epoch_ms % 1000);
+
+	struct tm tmv;
+	localtime_r(&secs, &tmv);
 
 	char buf[32];
-	snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld.%03lld",
-		 (long long)h, (long long)m, (long long)s, (long long)ms);
+	snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", tmv.tm_hour,
+		 tmv.tm_min, tmv.tm_sec, ms);
 	return std::string(buf);
 }
 
 static void write_segments(whisper_filter *f, uint64_t base_samples,
-			   bool save_timestamps,
+			   bool save_timestamps, const std::string &source_label,
 			   const std::vector<WhisperSegment> &segments)
 {
-	if (!f->out_file.is_open() || segments.empty())
+	if (!f->sink || segments.empty())
 		return;
 
-	const int64_t base_ms = (int64_t)(base_samples * 1000 / WHISPER_SR);
+	/* Absolute wall-clock time of the start of this window. */
+	const int64_t base_ms =
+		f->start_walltime_ms + (int64_t)(base_samples * 1000 / WHISPER_SR);
 
 	for (const auto &seg : segments) {
-		if (save_timestamps) {
-			f->out_file << "[" << format_timestamp(base_ms + seg.t0_ms)
-				    << " --> "
-				    << format_timestamp(base_ms + seg.t1_ms)
-				    << "] ";
-		}
-		f->out_file << seg.text << "\n";
-		blog(LOG_DEBUG, "[obs-whisper] caption: %s", seg.text.c_str());
+		std::string line;
+		if (save_timestamps)
+			line += "[" + format_walltime(base_ms + seg.t0_ms) +
+				"] ";
+		if (!source_label.empty())
+			line += "[" + source_label + "] ";
+		line += seg.text;
+
+		caption_sink_write(f->sink, line);
+		blog(LOG_DEBUG, "[obs-whisper] caption: %s", line.c_str());
 	}
-	f->out_file.flush();
 }
 
 static void open_output_file(whisper_filter *f, const std::string &path)
 {
-	if (f->out_file.is_open())
-		f->out_file.close();
+	/* Release the previous file (closes it if we held the last reference). */
+	f->sink.reset();
 	f->open_output_path = path;
 
 	if (path.empty())
 		return;
 
-	/* Truncate on open: each session starts a fresh caption file. */
-	f->out_file.open(path, std::ios::out | std::ios::trunc);
-	if (!f->out_file.is_open()) {
-		blog(LOG_ERROR, "[obs-whisper] cannot open output file: %s",
-		     path.c_str());
-	} else {
+	f->sink = caption_sink_acquire(path);
+	if (f->sink)
 		blog(LOG_INFO, "[obs-whisper] writing captions to: %s",
 		     path.c_str());
-	}
 }
 
 /* ------------------------------------------------------------------ */
 /* Worker thread                                                      */
 /* ------------------------------------------------------------------ */
 
+/* Name of the source this filter is attached to, used to tag captions when
+ * several devices share one output file. */
+static std::string get_source_label(whisper_filter *f)
+{
+	obs_source_t *parent = obs_filter_get_parent(f->context);
+	const char *name = parent ? obs_source_get_name(parent) : nullptr;
+	return name ? std::string(name) : std::string();
+}
+
 static void process_window(whisper_filter *f, std::vector<float> &window,
 			   uint64_t base_samples, const std::string &language,
-			   bool translate, bool save_timestamps)
+			   bool translate, bool save_timestamps,
+			   const std::string &source_label)
 {
 	const int n_threads =
 		std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
@@ -167,9 +184,13 @@ static void process_window(whisper_filter *f, std::vector<float> &window,
 	     window.size(), window.size() / (double)WHISPER_SR, peak, rms);
 
 	/* Skip near-silent windows: running Whisper on silence wastes CPU and
-	 * tends to produce hallucinated text. */
-	if (peak < 0.01f) {
-		blog(LOG_INFO, "[obs-whisper] window is silent, skipping");
+	 * tends to produce hallucinated text. Require both a minimum peak and a
+	 * minimum sustained energy (RMS); a window that is mostly silent with a
+	 * single click can exceed the peak gate yet still hallucinate. */
+	if (peak < 0.02f || rms < 0.005) {
+		blog(LOG_INFO,
+		     "[obs-whisper] window is silent (peak=%.4f rms=%.4f), skipping",
+		     peak, rms);
 		return;
 	}
 
@@ -178,7 +199,8 @@ static void process_window(whisper_filter *f, std::vector<float> &window,
 				  segments)) {
 		blog(LOG_INFO, "[obs-whisper] whisper produced %zu segment(s)",
 		     segments.size());
-		write_segments(f, base_samples, save_timestamps, segments);
+		write_segments(f, base_samples, save_timestamps, source_label,
+			       segments);
 	} else {
 		blog(LOG_WARNING,
 		     "[obs-whisper] transcription returned no result");
@@ -194,6 +216,7 @@ static void worker_run(whisper_filter *f)
 		bool translate = false;
 		bool use_gpu = true;
 		bool save_timestamps = true;
+		bool label_source = true;
 		bool need_reopen = false;
 		std::vector<float> window;
 		uint64_t base_samples = 0;
@@ -218,6 +241,7 @@ static void worker_run(whisper_filter *f)
 			translate = f->translate;
 			use_gpu = f->use_gpu;
 			save_timestamps = f->save_timestamps;
+			label_source = f->label_source;
 
 			if (f->reopen_output) {
 				need_reopen = true;
@@ -258,8 +282,10 @@ static void worker_run(whisper_filter *f)
 
 		/* Transcribe. */
 		if (!window.empty() && f->whisper.loaded()) {
+			const std::string label =
+				label_source ? get_source_label(f) : std::string();
 			process_window(f, window, base_samples, language,
-				       translate, save_timestamps);
+				       translate, save_timestamps, label);
 		}
 	}
 
@@ -269,6 +295,7 @@ static void worker_run(whisper_filter *f)
 	std::string language;
 	bool translate;
 	bool save_timestamps;
+	bool label_source;
 	{
 		std::lock_guard<std::mutex> lk(f->mtx);
 		tail.swap(f->buffer);
@@ -276,13 +303,17 @@ static void worker_run(whisper_filter *f)
 		language = f->language;
 		translate = f->translate;
 		save_timestamps = f->save_timestamps;
+		label_source = f->label_source;
 	}
-	if (!tail.empty() && f->whisper.loaded())
+	if (!tail.empty() && f->whisper.loaded()) {
+		const std::string label =
+			label_source ? get_source_label(f) : std::string();
 		process_window(f, tail, base_samples, language, translate,
-			       save_timestamps);
+			       save_timestamps, label);
+	}
 
-	if (f->out_file.is_open())
-		f->out_file.close();
+	/* Release our reference to the caption file. */
+	f->sink.reset();
 }
 
 /* ------------------------------------------------------------------ */
@@ -304,6 +335,7 @@ static void whisper_filter_update(void *data, obs_data_t *settings)
 	const bool translate = obs_data_get_bool(settings, S_TRANSLATE);
 	const bool use_gpu = obs_data_get_bool(settings, S_USE_GPU);
 	const bool timestamps = obs_data_get_bool(settings, S_TIMESTAMPS);
+	const bool label_source = obs_data_get_bool(settings, S_LABEL_SOURCE);
 	int window_sec = (int)obs_data_get_int(settings, S_WINDOW_SEC);
 	if (window_sec < 1)
 		window_sec = 1;
@@ -314,6 +346,7 @@ static void whisper_filter_update(void *data, obs_data_t *settings)
 	f->translate = translate;
 	f->use_gpu = use_gpu;
 	f->save_timestamps = timestamps;
+	f->label_source = label_source;
 	f->window_samples = (size_t)window_sec * WHISPER_SR;
 
 	std::string new_output = output ? output : "";
@@ -328,6 +361,12 @@ static void *whisper_filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	auto *f = new whisper_filter();
 	f->context = source;
+
+	/* Record session start in wall-clock time for absolute timestamps. */
+	f->start_walltime_ms =
+		(int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::system_clock::now().time_since_epoch())
+			.count();
 
 	/* Determine the source/global audio sample rate. */
 	audio_t *audio = obs_get_audio();
@@ -468,6 +507,7 @@ static void whisper_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_TRANSLATE, false);
 	obs_data_set_default_bool(settings, S_USE_GPU, true);
 	obs_data_set_default_bool(settings, S_TIMESTAMPS, true);
+	obs_data_set_default_bool(settings, S_LABEL_SOURCE, true);
 	obs_data_set_default_int(settings, S_WINDOW_SEC, 10);
 }
 
@@ -510,6 +550,9 @@ static obs_properties_t *whisper_filter_properties(void *)
 
 	obs_properties_add_bool(props, S_TIMESTAMPS,
 				obs_module_text("SaveTimestamps"));
+
+	obs_properties_add_bool(props, S_LABEL_SOURCE,
+				obs_module_text("LabelSource"));
 
 	obs_properties_add_bool(props, S_USE_GPU, obs_module_text("UseGPU"));
 
