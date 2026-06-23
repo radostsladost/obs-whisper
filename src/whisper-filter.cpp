@@ -11,9 +11,9 @@
 #include "whisper-context.h"
 
 #include <obs-module.h>
-#include <media-io/audio-resampler.h>
 
 #include <condition_variable>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
@@ -37,9 +37,12 @@ static constexpr uint32_t WHISPER_SR = 16000;
 struct whisper_filter {
 	obs_source_t *context = nullptr;
 
-	/* Resampler: source audio -> 16 kHz mono float. Created once. */
-	audio_resampler_t *resampler = nullptr;
+	/* Source sample rate; audio is downmixed + resampled to 16 kHz mono. */
 	uint32_t in_sample_rate = 48000;
+
+	/* Linear-resampler state (touched only on the audio thread). */
+	double resample_pos = 0.0;
+	float resample_prev = 0.0f;
 
 	/* Worker thread + synchronization. */
 	std::thread thread;
@@ -50,6 +53,10 @@ struct whisper_filter {
 	/* Captured 16 kHz mono audio waiting to be transcribed (under mtx). */
 	std::vector<float> buffer;
 	uint64_t consumed_samples = 0; /* total 16 kHz samples processed/dropped */
+	uint64_t received_frames = 0;  /* diagnostics: total input frames seen */
+	bool logged_first_audio = false;
+	float raw_peak_max = 0.0f;     /* diagnostics: raw input level */
+	uint64_t frames_since_log = 0;
 
 	/* Desired settings (written by update(), read by the worker; under mtx). */
 	std::string desired_model_path;
@@ -63,6 +70,7 @@ struct whisper_filter {
 
 	/* Worker-thread-only state. */
 	WhisperContext whisper;
+	bool loaded_gpu = true; /* GPU setting the current model was loaded with */
 	std::ofstream out_file;
 	std::string open_output_path;
 };
@@ -141,10 +149,39 @@ static void process_window(whisper_filter *f, std::vector<float> &window,
 	const int n_threads =
 		std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
 
+	/* Measure signal level so we can tell silence apart from a real
+	 * transcription problem. */
+	float peak = 0.0f;
+	double sum_sq = 0.0;
+	for (float s : window) {
+		float a = std::fabs(s);
+		if (a > peak)
+			peak = a;
+		sum_sq += (double)s * s;
+	}
+	const double rms =
+		window.empty() ? 0.0 : sqrt(sum_sq / (double)window.size());
+
+	blog(LOG_INFO,
+	     "[obs-whisper] transcribing %zu samples (%.1fs) peak=%.4f rms=%.4f",
+	     window.size(), window.size() / (double)WHISPER_SR, peak, rms);
+
+	/* Skip near-silent windows: running Whisper on silence wastes CPU and
+	 * tends to produce hallucinated text. */
+	if (peak < 0.01f) {
+		blog(LOG_INFO, "[obs-whisper] window is silent, skipping");
+		return;
+	}
+
 	std::vector<WhisperSegment> segments;
 	if (f->whisper.transcribe(window, language, translate, n_threads,
 				  segments)) {
+		blog(LOG_INFO, "[obs-whisper] whisper produced %zu segment(s)",
+		     segments.size());
 		write_segments(f, base_samples, save_timestamps, segments);
+	} else {
+		blog(LOG_WARNING,
+		     "[obs-whisper] transcription returned no result");
 	}
 }
 
@@ -167,6 +204,8 @@ static void worker_run(whisper_filter *f)
 				return !f->running || f->reopen_output ||
 				       f->desired_model_path !=
 					       f->whisper.model_path() ||
+				       (f->whisper.loaded() &&
+					f->use_gpu != f->loaded_gpu) ||
 				       f->buffer.size() >= f->window_samples;
 			});
 
@@ -201,12 +240,20 @@ static void worker_run(whisper_filter *f)
 		if (need_reopen && out_path != f->open_output_path)
 			open_output_file(f, out_path);
 
-		/* Apply model changes. */
-		if (desired_model != f->whisper.model_path()) {
-			if (desired_model.empty())
+		/* Apply model changes (path change, or GPU toggle on a loaded
+		 * model, both require reloading the Whisper context). */
+		const bool path_changed =
+			desired_model != f->whisper.model_path();
+		const bool gpu_changed =
+			!desired_model.empty() && f->whisper.loaded() &&
+			use_gpu != f->loaded_gpu;
+		if (path_changed || gpu_changed) {
+			if (desired_model.empty()) {
 				f->whisper.unload();
-			else
+			} else {
 				f->whisper.load(desired_model, use_gpu);
+				f->loaded_gpu = use_gpu;
+			}
 		}
 
 		/* Transcribe. */
@@ -282,28 +329,12 @@ static void *whisper_filter_create(obs_data_t *settings, obs_source_t *source)
 	auto *f = new whisper_filter();
 	f->context = source;
 
-	/* Build the resampler from the global OBS audio format. */
+	/* Determine the source/global audio sample rate. */
 	audio_t *audio = obs_get_audio();
 	const struct audio_output_info *aoi =
 		audio ? audio_output_get_info(audio) : nullptr;
-
-	if (aoi) {
-		struct resample_info src;
-		src.samples_per_sec = aoi->samples_per_sec;
-		src.format = AUDIO_FORMAT_FLOAT_PLANAR;
-		src.speakers = aoi->speakers;
-
-		struct resample_info dst;
-		dst.samples_per_sec = WHISPER_SR;
-		dst.format = AUDIO_FORMAT_FLOAT_PLANAR;
-		dst.speakers = SPEAKERS_MONO;
-
+	if (aoi && aoi->samples_per_sec > 0)
 		f->in_sample_rate = aoi->samples_per_sec;
-		f->resampler = audio_resampler_create(&dst, &src);
-	}
-
-	if (!f->resampler)
-		blog(LOG_ERROR, "[obs-whisper] failed to create resampler");
 
 	whisper_filter_update(f, settings);
 
@@ -325,9 +356,6 @@ static void whisper_filter_destroy(void *data)
 	if (f->thread.joinable())
 		f->thread.join();
 
-	if (f->resampler)
-		audio_resampler_destroy(f->resampler);
-
 	delete f;
 }
 
@@ -336,30 +364,83 @@ whisper_filter_audio(void *data, struct obs_audio_data *audio)
 {
 	auto *f = static_cast<whisper_filter *>(data);
 
-	if (!audio || audio->frames == 0 || !f->resampler)
+	if (!audio || audio->frames == 0)
 		return audio;
 
-	/* Downsampling never produces more frames than the input; add a small
-	 * margin to be safe across resampler internal buffering. */
-	const size_t out_cap =
-		(size_t)audio->frames * WHISPER_SR / f->in_sample_rate + 64;
+	const uint32_t frames = audio->frames;
 
-	uint8_t *output[MAX_AV_PLANES];
-	memset(output, 0, sizeof(output));
-	std::vector<float> resampled(out_cap);
-	output[0] = reinterpret_cast<uint8_t *>(resampled.data());
+	/* Collect the populated channel planes (OBS delivers planar float). */
+	const float *planes[MAX_AV_PLANES];
+	size_t n_channels = 0;
+	for (size_t ch = 0; ch < MAX_AV_PLANES; ++ch) {
+		const float *p = reinterpret_cast<const float *>(audio->data[ch]);
+		if (p)
+			planes[n_channels++] = p;
+	}
+	if (n_channels == 0)
+		return audio;
 
-	uint32_t out_frames = 0;
-	uint64_t ts_offset = 0;
-	bool ok = audio_resampler_resample(
-		f->resampler, output, &out_frames, &ts_offset,
-		(const uint8_t *const *)audio->data, audio->frames);
+	/* Downmix to mono. */
+	std::vector<float> mono(frames);
+	float in_peak = 0.0f;
+	for (uint32_t i = 0; i < frames; ++i) {
+		float sum = 0.0f;
+		for (size_t ch = 0; ch < n_channels; ++ch)
+			sum += planes[ch][i];
+		float s = sum / (float)n_channels;
+		mono[i] = s;
+		float a = std::fabs(s);
+		if (a > in_peak)
+			in_peak = a;
+	}
 
-	if (ok && out_frames > 0) {
+	/* Linear-resample mono from in_sample_rate to 16 kHz, carrying the
+	 * fractional position and last sample across buffers for continuity.
+	 * Virtual index -1 refers to the previous buffer's last sample. */
+	const double ratio = (double)f->in_sample_rate / (double)WHISPER_SR;
+	std::vector<float> resampled;
+	resampled.reserve((size_t)(frames / ratio) + 2);
+
+	double pos = f->resample_pos;
+	const float prev = f->resample_prev;
+	while (true) {
+		int i0 = (int)std::floor(pos);
+		if (i0 + 1 > (int)frames - 1)
+			break;
+		const double frac = pos - i0;
+		const float s0 = (i0 < 0) ? prev : mono[i0];
+		const float s1 = mono[i0 + 1];
+		resampled.push_back((float)(s0 + (s1 - s0) * frac));
+		pos += ratio;
+	}
+	f->resample_pos = pos - (double)frames;
+	f->resample_prev = mono[frames - 1];
+
+	{
 		std::lock_guard<std::mutex> lk(f->mtx);
 
+		if (!f->logged_first_audio) {
+			f->logged_first_audio = true;
+			blog(LOG_INFO,
+			     "[obs-whisper] receiving audio: %u in-frames @ %u Hz, %zu channel(s) -> %zu out-samples @ %u Hz",
+			     frames, f->in_sample_rate, n_channels,
+			     resampled.size(), WHISPER_SR);
+		}
+		f->received_frames += frames;
+
+		if (in_peak > f->raw_peak_max)
+			f->raw_peak_max = in_peak;
+		f->frames_since_log += frames;
+		if (f->frames_since_log >= f->in_sample_rate * 5) {
+			blog(LOG_INFO,
+			     "[obs-whisper] raw input peak over last ~5s: %.4f",
+			     f->raw_peak_max);
+			f->raw_peak_max = 0.0f;
+			f->frames_since_log = 0;
+		}
+
 		f->buffer.insert(f->buffer.end(), resampled.begin(),
-				 resampled.begin() + out_frames);
+				 resampled.end());
 
 		/* Bound memory/latency if transcription falls behind: drop the
 		 * oldest audio while keeping the timeline aligned. */
@@ -405,7 +486,7 @@ static obs_properties_t *whisper_filter_properties(void *)
 
 	obs_property_t *lang = obs_properties_add_list(
 		props, S_LANGUAGE, obs_module_text("Language"),
-		OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(lang, obs_module_text("AutoDetect"),
 				     "auto");
 	obs_property_list_add_string(lang, "English", "en");

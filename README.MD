@@ -58,6 +58,40 @@ If CMake can't find `libobs`, point it at your OBS development files:
 cmake -B build -Dlibobs_DIR=/path/to/obs-studio/build/libobs
 ```
 
+### GPU acceleration
+
+By default whisper.cpp is built **CPU-only**, and the filter's *Use GPU* toggle
+has no effect. Enable a GPU backend at configure time. After changing the
+backend, do a clean reconfigure (`rm -rf build`).
+
+**Vulkan (recommended on Linux — works with the driver you already have):**
+
+```sh
+# Prerequisites (Ubuntu/Debian): Vulkan loader + a shader compiler
+sudo apt install libvulkan-dev glslc        # or: glslang-tools
+
+rm -rf build
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_VULKAN=ON
+cmake --build build
+cmake --install build
+```
+
+**CUDA (NVIDIA, best performance — needs the CUDA toolkit):**
+
+```sh
+# Requires nvcc matching your GPU. RTX 50-series (Blackwell, sm_120) needs
+# CUDA 12.8 or newer. Install from NVIDIA's CUDA repository, then:
+rm -rf build
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_CUDA=ON
+cmake --build build
+cmake --install build
+```
+
+To confirm the GPU backend is active, watch the OBS log when the model loads —
+whisper.cpp prints lines such as `ggml_vulkan: Found ... GPU` or
+`ggml_cuda_init: found 1 CUDA devices`. Make sure the filter's **Use GPU**
+option is enabled.
+
 ### Install locations
 
 The default install copies the module and its `data/` directory into the

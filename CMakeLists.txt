@@ -24,6 +24,21 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(libobs REQUIRED)
 
 # ---------------------------------------------------------------------------
+# GPU acceleration (optional)
+#
+# whisper.cpp builds CPU-only by default. Enable one of these to use the GPU:
+#
+#   -DWHISPER_CUDA=ON    NVIDIA, best performance. Requires the CUDA toolkit
+#                        (nvcc) matching your GPU (RTX 50-series needs CUDA 12.8+).
+#   -DWHISPER_VULKAN=ON  Any GPU. Requires Vulkan headers/loader and a shader
+#                        compiler (glslc, from the shaderc/glslc package).
+#
+# The plugin's "Use GPU" toggle only has an effect when one of these is built in.
+# ---------------------------------------------------------------------------
+option(WHISPER_CUDA "Build whisper.cpp with CUDA (NVIDIA) GPU support" OFF)
+option(WHISPER_VULKAN "Build whisper.cpp with Vulkan GPU support" OFF)
+
+# ---------------------------------------------------------------------------
 # whisper.cpp (fetched and built statically)
 # ---------------------------------------------------------------------------
 include(FetchContent)
@@ -31,19 +46,31 @@ include(FetchContent)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+set(WHISPER_INSTALL OFF CACHE BOOL "" FORCE)
+set(GGML_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+if(WHISPER_CUDA)
+  set(GGML_CUDA ON CACHE BOOL "" FORCE)
+  message(STATUS "obs-whisper: building whisper.cpp with CUDA backend")
+endif()
+if(WHISPER_VULKAN)
+  set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+  message(STATUS "obs-whisper: building whisper.cpp with Vulkan backend")
+endif()
 
 FetchContent_Declare(
   whispercpp
   GIT_REPOSITORY https://github.com/ggerganov/whisper.cpp.git
   GIT_TAG v1.7.4
+  EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(whispercpp)
 
 # whisper.cpp overrides CMAKE_POSITION_INDEPENDENT_CODE internally when built
 # as static libraries, so force PIC on the actual targets. Without this the
 # static archives cannot be linked into our shared plugin module.
-foreach(_whisper_tgt whisper ggml ggml-base ggml-cpu)
+foreach(_whisper_tgt whisper ggml ggml-base ggml-cpu ggml-cuda ggml-vulkan)
   if(TARGET ${_whisper_tgt})
     set_target_properties(${_whisper_tgt} PROPERTIES
       POSITION_INDEPENDENT_CODE ON)
