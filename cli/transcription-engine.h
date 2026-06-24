@@ -27,6 +27,7 @@ struct TranscriptionConfig {
 	bool translate = false;
 	bool use_gpu = false;
 	bool timestamps = false;
+	bool show_labels = true; /* prefix lines with the source device name */
 	int n_threads = 0; /* 0 = auto-detect from hardware concurrency */
 };
 

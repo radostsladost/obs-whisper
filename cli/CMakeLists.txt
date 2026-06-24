@@ -22,4 +22,17 @@ target_link_libraries(whisper-cli
     Qt6::Multimedia
 )
 
-install(TARGETS whisper-cli RUNTIME DESTINATION bin)
+# Install location for the CLI. Defaults to a per-user bin directory so a plain
+# `cmake --install build` needs no root; override for a system-wide install,
+# e.g. -DWHISPER_CLI_DESTINATION=/usr/local/bin (which then requires sudo).
+if(NOT DEFINED WHISPER_CLI_DESTINATION)
+  if(WIN32)
+    set(WHISPER_CLI_DESTINATION "bin")
+  else()
+    set(WHISPER_CLI_DESTINATION "$ENV{HOME}/.local/bin")
+  endif()
+endif()
+
+install(TARGETS whisper-cli
+  RUNTIME DESTINATION "${WHISPER_CLI_DESTINATION}"
+  COMPONENT cli)

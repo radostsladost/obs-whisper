@@ -92,6 +92,8 @@ void print_usage(const char *argv0)
 		     "  --language <code>   Language code (e.g. en, ru) or 'auto'. Default: auto\n"
 		     "  --translate         Translate transcription to English\n"
 		     "  --timestamps        Prefix each line with [start --> end]\n"
+		     "  --no-labels         Don't prefix each line with the source\n"
+		     "                      device (mic/sink) name\n"
 		     "  --window <seconds>  Transcription window length (default 10)\n"
 		     "  --threads <n>       Inference threads (default: auto)\n"
 		     "  --gpu               Use GPU (only if built with CUDA/Vulkan)\n"
@@ -216,6 +218,8 @@ int main(int argc, char *argv[])
 			cfg.translate = true;
 		} else if (a == "--timestamps") {
 			cfg.timestamps = true;
+		} else if (a == "--no-labels") {
+			cfg.show_labels = false;
 		} else if (a == "--gpu") {
 			cfg.use_gpu = true;
 		} else if (a == "--verbose" || a == "-v") {

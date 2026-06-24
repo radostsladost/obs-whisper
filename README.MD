@@ -110,20 +110,38 @@ option is enabled.
 
 ### Install locations
 
-The default install copies the module and its `data/` directory into the
-per-user OBS plugin folder:
-
-- **Linux:** `~/.config/obs-studio/plugins/obs-whisper/`
-- **Windows:** override `OBS_PLUGIN_DESTINATION` / `OBS_DATA_DESTINATION` to your
-  OBS install (e.g. `.../obs-studio/obs-plugins/64bit`).
-
-You can override the destinations:
+The build produces two independently installable pieces, each in its own CMake
+install **component** so you can install just one:
 
 ```sh
-cmake --install build --prefix /where/obs/lives \
+cmake --install build --component plugin   # the OBS filter
+cmake --install build --component cli       # the standalone CLI
+cmake --install build                       # both (the default)
+```
+
+Both default to **per-user, root-free** locations, so no `sudo` is needed:
+
+- **OBS plugin** → `~/.config/obs-studio/plugins/obs-whisper/`
+- **CLI** → `~/.local/bin/whisper-cli` (make sure `~/.local/bin` is on your
+  `PATH`)
+
+You can override either destination. For the plugin:
+
+```sh
+cmake --install build --component plugin --prefix /where/obs/lives \
   -DOBS_PLUGIN_DESTINATION=obs-plugins/64bit \
   -DOBS_DATA_DESTINATION=data/obs-plugins/obs-whisper
 ```
+
+For a system-wide CLI install (this one needs `sudo`):
+
+```sh
+cmake -B build -DWHISPER_CLI_DESTINATION=/usr/local/bin
+cmake --build build
+sudo cmake --install build --component cli
+```
+
+On Windows the CLI defaults to `<prefix>/bin`.
 
 ## Usage
 
@@ -197,6 +215,7 @@ Useful options (see `--help` for the full list):
 | `--language <code>` | Language code (e.g. `en`, `ru`) or `auto` (default).     |
 | `--translate`       | Translate the transcription to English.                  |
 | `--timestamps`      | Prefix each line with `[start --> end]`.                 |
+| `--no-labels`       | Don't prefix each line with the source device (mic/sink) name. |
 | `--window <sec>`    | Transcription window length, 1–30 s (default 10).        |
 | `--threads <n>`     | Inference threads (default: auto).                       |
 | `--gpu`             | Use the GPU (only if built with CUDA/Vulkan).            |

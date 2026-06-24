@@ -89,13 +89,17 @@ void TranscriptionEngine::emitSegment(const std::string &label, int64_t base_ms,
 {
 	/* Transcripts go to stdout (clean, line-buffered, flushed) so they can
 	 * be piped; all status/diagnostics go to stderr via wlog. */
-	if (cfg_.timestamps) {
-		const std::string t0 = format_timestamp(base_ms + seg.t0_ms);
-		const std::string t1 = format_timestamp(base_ms + seg.t1_ms);
-		std::printf("[%s] [%s --> %s] %s\n", label.c_str(), t0.c_str(),
-			    t1.c_str(), seg.text.c_str());
+	const std::string ts =
+		cfg_.timestamps
+			? "[" + format_timestamp(base_ms + seg.t0_ms) +
+				  " --> " + format_timestamp(base_ms + seg.t1_ms) +
+				  "] "
+			: std::string();
+	if (cfg_.show_labels) {
+		std::printf("[%s] %s%s\n", label.c_str(), ts.c_str(),
+			    seg.text.c_str());
 	} else {
-		std::printf("[%s] %s\n", label.c_str(), seg.text.c_str());
+		std::printf("%s%s\n", ts.c_str(), seg.text.c_str());
 	}
 	std::fflush(stdout);
 }
