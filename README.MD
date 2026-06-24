@@ -80,7 +80,7 @@ By default whisper.cpp is built **CPU-only**, and the filter's *Use GPU* toggle
 has no effect. Enable a GPU backend at configure time. After changing the
 backend, do a clean reconfigure (`rm -rf build`).
 
-**Vulkan (recommended on Linux — works with the driver you already have):**
+**Vulkan (recommended on Linux — works with the most drivers):**
 
 ```sh
 # Prerequisites (Ubuntu/Debian): Vulkan loader + a shader compiler
