@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "window-accumulator.h"
+
 #include <QAudioDevice>
 #include <QAudioFormat>
 #include <QByteArray>
@@ -49,7 +51,6 @@ private slots:
 
 private:
 	void pushChunk(const std::vector<float> &mono);
-	void flushWindows();
 
 	QAudioDevice device_;
 	QString label_;
@@ -60,9 +61,8 @@ private:
 	QIODevice *io_ = nullptr;
 	QTimer *pull_timer_ = nullptr;
 
-	size_t window_samples_;
-	double window_seconds_;
-	std::vector<float> window_;
+	/* Windowing / slicing / submission to the engine. */
+	WindowAccumulator acc_;
 
 	/* Diagnostics. */
 	bool logged_first_audio_ = false;
@@ -75,7 +75,4 @@ private:
 
 	/* Bytes left over from a read that didn't end on a frame boundary. */
 	QByteArray partial_;
-
-	/* Total 16 kHz samples already submitted, for timeline timestamps. */
-	int64_t submitted_samples_ = 0;
 };

@@ -160,7 +160,7 @@ By default it is quiet — only the transcribed text goes to stdout and nothing
 else. Pass `--verbose` to see diagnostics (model loading, per-window audio
 levels, whisper/ggml/Qt logs) on stderr.
 
-List the available input devices:
+List the available audio devices (input devices and output sinks):
 
 ```sh
 ./build/cli/whisper-cli --list
@@ -170,6 +170,13 @@ Transcribe **all** input devices (the default) with a model:
 
 ```sh
 ./build/cli/whisper-cli --model /path/to/ggml-base.en.bin
+```
+
+Transcribe **system/desktop audio** from an output sink instead of a mic
+(Linux only — see below):
+
+```sh
+./build/cli/whisper-cli --model /path/to/ggml-base.en.bin --sink default
 ```
 
 Each output line is tagged with the device it came from:
@@ -184,8 +191,9 @@ Useful options (see `--help` for the full list):
 | Option              | Meaning                                                  |
 | ------------------- | -------------------------------------------------------- |
 | `--model <path>`    | Whisper `ggml`/`gguf` model (required unless `--list`).  |
-| `--list`            | List input devices and exit.                             |
-| `--device <match>`  | Only capture devices whose name contains `<match>` (case-insensitive). Repeatable; default is every device. |
+| `--list`            | List input devices and output sinks, then exit.          |
+| `--device <match>`  | Only capture input devices whose name contains `<match>` (case-insensitive), or `default` for the default input. Repeatable; default is every input device (unless `--sink` is given). |
+| `--sink <match>`    | Also capture system/desktop audio from output sink(s) whose name contains `<match>`, or `default` for the default output. Repeatable. **Linux only.** |
 | `--language <code>` | Language code (e.g. `en`, `ru`) or `auto` (default).     |
 | `--translate`       | Translate the transcription to English.                  |
 | `--timestamps`      | Prefix each line with `[start --> end]`.                 |
@@ -200,6 +208,18 @@ Example — only the USB mic, in Russian, translated to English, with timestamps
 ./build/cli/whisper-cli --model ggml-base.bin \
   --device USB --language ru --translate --timestamps
 ```
+
+Example — transcribe the mic **and** desktop audio at the same time:
+
+```sh
+./build/cli/whisper-cli --model ggml-base.en.bin --device default --sink default
+```
+
+**Capturing sinks (desktop audio):** Qt does not expose sink monitors for
+capture, so `--sink` records the sink's monitor through an external recorder —
+[`pw-record`](https://docs.pipewire.org/page_man_pw-record_1.html) (PipeWire),
+falling back to `parec` (PulseAudio). One of those must be on your `PATH`; this
+is a Linux-only feature.
 
 Press **Ctrl-C** to stop. Because output is line-buffered on stdout, you can
 pipe it straight into other tools, e.g. `whisper-cli --model ... | tee log.txt`.

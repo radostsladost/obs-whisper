@@ -1,7 +1,6 @@
 #include "device-capture.h"
 #include "transcription-engine.h"
 #include "whisper-log.h"
-#include "window-slicer.h"
 
 #include <QAudioSource>
 #include <QIODevice>
@@ -15,26 +14,6 @@
 namespace {
 
 constexpr int kTargetRate = 16000;
-
-struct WindowMetrics {
-	float peak;
-	double rms;
-};
-
-WindowMetrics measure_window(const std::vector<float> &w)
-{
-	if (w.empty())
-		return {0.0f, 0.0};
-	float peak = 0.0f;
-	double sum_sq = 0.0;
-	for (float s : w) {
-		const float a = std::fabs(s);
-		if (a > peak)
-			peak = a;
-		sum_sq += (double)s * s;
-	}
-	return {peak, std::sqrt(sum_sq / (double)w.size())};
-}
 
 /* Convert one interleaved frame's worth of samples to a mono float in [-1, 1]
  * by averaging channels. `frame` points at the first byte of the frame. */
@@ -103,11 +82,9 @@ DeviceCapture::DeviceCapture(const QAudioDevice &device,
 			     TranscriptionEngine *engine, double window_seconds,
 			     QObject *parent)
 	: QObject(parent), device_(device), label_(device.description()),
-	  engine_(engine)
+	  engine_(engine),
+	  acc_(device.description().toStdString(), engine, window_seconds)
 {
-	window_seconds_ = window_seconds;
-	window_samples_ =
-		(size_t)std::max(1.0, window_seconds * (double)kTargetRate);
 }
 
 DeviceCapture::~DeviceCapture()
@@ -170,7 +147,7 @@ bool DeviceCapture::start()
 	wlog(WLOG_INFO,
 	     "[cli] capturing '%s' @ %d Hz, %d ch, %s -> 16 kHz mono (window %.1fs)",
 	     label_.toUtf8().constData(), fmt.sampleRate(), fmt.channelCount(),
-	     sample_format_name(fmt.sampleFormat()), window_seconds_);
+	     sample_format_name(fmt.sampleFormat()), acc_.windowSeconds());
 	return true;
 }
 
@@ -237,9 +214,8 @@ void DeviceCapture::pushChunk(const std::vector<float> &mono)
 
 	/* Fast path: already at the target rate, no resampling needed. */
 	if (std::fabs(in_rate_ - (double)kTargetRate) < 1e-6) {
-		window_.insert(window_.end(), mono.begin(), mono.end());
 		resample_prev_ = mono.back();
-		flushWindows();
+		acc_.feed(mono.data(), mono.size());
 		return;
 	}
 
@@ -250,6 +226,9 @@ void DeviceCapture::pushChunk(const std::vector<float> &mono)
 	double pos = resample_pos_;
 	const float prev = resample_prev_;
 
+	std::vector<float> out;
+	out.reserve((size_t)((double)frames / ratio) + 2);
+
 	while (true) {
 		const int i0 = (int)std::floor(pos);
 		if (i0 + 1 > (int)frames - 1)
@@ -257,47 +236,12 @@ void DeviceCapture::pushChunk(const std::vector<float> &mono)
 		const double frac = pos - i0;
 		const float s0 = (i0 < 0) ? prev : mono[i0];
 		const float s1 = mono[i0 + 1];
-		window_.push_back((float)(s0 + (s1 - s0) * frac));
+		out.push_back((float)(s0 + (s1 - s0) * frac));
 		pos += ratio;
 	}
 
 	resample_pos_ = pos - (double)frames;
 	resample_prev_ = mono[frames - 1];
 
-	flushWindows();
-}
-
-void DeviceCapture::flushWindows()
-{
-	/* Cut each window at a pause near the configured length rather than at a
-	 * blind sample offset, so a word spoken across the boundary isn't split
-	 * between two transcripts. */
-	for (;;) {
-		const size_t cut = whisper_next_window(window_, window_samples_);
-		if (cut == 0)
-			break;
-
-		std::vector<float> w(window_.begin(), window_.begin() + cut);
-		window_.erase(window_.begin(), window_.begin() + cut);
-
-		const int64_t base_ms =
-			submitted_samples_ * 1000 / kTargetRate;
-		submitted_samples_ += (int64_t)cut;
-
-		/* Skip near-silent windows: running whisper on silence wastes
-		 * time and tends to hallucinate text. */
-		const WindowMetrics m = measure_window(w);
-		if (m.peak < 0.02f || m.rms < 0.005) {
-			wlog(WLOG_INFO,
-			     "[cli] '%s': window silent (peak=%.4f rms=%.4f), skipping",
-			     label_.toUtf8().constData(), m.peak, m.rms);
-			continue;
-		}
-
-		wlog(WLOG_INFO,
-		     "[cli] '%s': queuing %.1fs window (peak=%.4f rms=%.4f)",
-		     label_.toUtf8().constData(),
-		     (double)cut / (double)kTargetRate, m.peak, m.rms);
-		engine_->submit(label_.toStdString(), std::move(w), base_ms);
-	}
+	acc_.feed(out.data(), out.size());
 }

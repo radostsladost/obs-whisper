@@ -10,6 +10,8 @@ set(CMAKE_AUTOMOC ON)
 add_executable(whisper-cli
   main.cpp
   device-capture.cpp
+  monitor-capture.cpp
+  window-accumulator.cpp
   transcription-engine.cpp
 )
 

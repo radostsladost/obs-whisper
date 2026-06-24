@@ -31,6 +31,7 @@
 #endif
 
 #include "device-capture.h"
+#include "monitor-capture.h"
 #include "transcription-engine.h"
 #include "whisper-log.h"
 
@@ -79,10 +80,15 @@ void print_usage(const char *argv0)
 		     "Options:\n"
 		     "  --model <path>      Path to a ggml/gguf whisper model (required\n"
 		     "                      unless --list). e.g. ggml-base.en.bin\n"
-		     "  --list              List available audio input devices and exit\n"
-		     "  --device <match>    Only capture devices whose name contains <match>\n"
-		     "                      (case-insensitive). Repeatable. Default: all\n"
-		     "                      input devices.\n"
+		     "  --list              List available audio devices and exit\n"
+		     "  --device <match>    Only capture input devices whose name contains\n"
+		     "                      <match> (case-insensitive), or 'default' for the\n"
+		     "                      default input. Repeatable. Default: all input\n"
+		     "                      devices (unless --sink is given).\n"
+		     "  --sink <match>      Also capture system/desktop audio from output\n"
+		     "                      sink(s) whose name contains <match>, or 'default'\n"
+		     "                      for the default output. Repeatable. Linux only\n"
+		     "                      (records the sink monitor via pw-record / parec).\n"
 		     "  --language <code>   Language code (e.g. en, ru) or 'auto'. Default: auto\n"
 		     "  --translate         Translate transcription to English\n"
 		     "  --timestamps        Prefix each line with [start --> end]\n"
@@ -98,29 +104,71 @@ void print_usage(const char *argv0)
 void list_devices()
 {
 	const QList<QAudioDevice> inputs = QMediaDevices::audioInputs();
-	const QAudioDevice def = QMediaDevices::defaultAudioInput();
+	const QAudioDevice def_in = QMediaDevices::defaultAudioInput();
 
 	if (inputs.isEmpty()) {
 		std::printf("No audio input devices found.\n");
-		return;
+	} else {
+		std::printf("Audio input devices (capture with --device):\n");
+		for (const QAudioDevice &d : inputs) {
+			const bool is_default = (d.id() == def_in.id());
+			std::printf("  %s%s\n",
+				    d.description().toUtf8().constData(),
+				    is_default ? "  (default)" : "");
+		}
 	}
 
-	std::printf("Audio input devices:\n");
-	for (const QAudioDevice &d : inputs) {
-		const bool is_default = (d.id() == def.id());
-		std::printf("  %s%s\n", d.description().toUtf8().constData(),
-			    is_default ? "  (default)" : "");
+	const QList<QAudioDevice> outputs = QMediaDevices::audioOutputs();
+	const QAudioDevice def_out = QMediaDevices::defaultAudioOutput();
+
+	if (!outputs.isEmpty()) {
+		std::printf("\nOutput sinks / system audio (capture with --sink):\n");
+		for (const QAudioDevice &d : outputs) {
+			const bool is_default = (d.id() == def_out.id());
+			std::printf("  %s%s\n",
+				    d.description().toUtf8().constData(),
+				    is_default ? "  (default)" : "");
+		}
 	}
+
 	std::fflush(stdout);
 }
 
-bool device_matches(const QAudioDevice &d, const QStringList &filters)
+bool device_matches(const QAudioDevice &d, const QStringList &filters,
+		    const QAudioDevice &def_in)
 {
 	if (filters.isEmpty())
 		return true;
 	const QString name = d.description();
+	const QString id = QString::fromUtf8(d.id());
 	for (const QString &f : filters) {
-		if (name.contains(f, Qt::CaseInsensitive))
+		if (f.compare(QStringLiteral("default"),
+			      Qt::CaseInsensitive) == 0 &&
+		    d.id() == def_in.id())
+			return true;
+		if (name.contains(f, Qt::CaseInsensitive) ||
+		    id.contains(f, Qt::CaseInsensitive))
+			return true;
+	}
+	return false;
+}
+
+/* Sinks are matched against both the (often localized) description and the
+ * stable device id, plus the special keyword "default". Unlike inputs, an
+ * empty filter list matches nothing: sinks are only captured when explicitly
+ * requested with --sink. */
+bool sink_matches(const QAudioDevice &d, const QStringList &filters,
+		  const QAudioDevice &def_out)
+{
+	const QString name = d.description();
+	const QString id = QString::fromUtf8(d.id());
+	for (const QString &f : filters) {
+		if (f.compare(QStringLiteral("default"),
+			      Qt::CaseInsensitive) == 0 &&
+		    d.id() == def_out.id())
+			return true;
+		if (name.contains(f, Qt::CaseInsensitive) ||
+		    id.contains(f, Qt::CaseInsensitive))
 			return true;
 	}
 	return false;
@@ -134,6 +182,7 @@ int main(int argc, char *argv[])
 
 	TranscriptionConfig cfg;
 	QStringList device_filters;
+	QStringList sink_filters;
 	double window_seconds = 10.0;
 	bool list_only = false;
 	bool verbose = false;
@@ -159,6 +208,8 @@ int main(int argc, char *argv[])
 			cfg.model_path = next("--model").toStdString();
 		} else if (a == "--device") {
 			device_filters << next("--device");
+		} else if (a == "--sink") {
+			sink_filters << next("--sink");
 		} else if (a == "--language") {
 			cfg.language = next("--language").toStdString();
 		} else if (a == "--translate") {
@@ -228,21 +279,46 @@ int main(int argc, char *argv[])
 		return 2;
 	}
 
-	/* Select devices. */
+	/* Select sources.
+	 *
+	 * Input devices (mics) are captured by default, but only when the user
+	 * hasn't asked for something more specific: giving --sink alone means
+	 * "just the sink(s)", while --device narrows the inputs. Sinks are only
+	 * captured when explicitly requested with --sink. */
+	const bool want_inputs =
+		!device_filters.isEmpty() || sink_filters.isEmpty();
+
 	const QList<QAudioDevice> inputs = QMediaDevices::audioInputs();
-	if (inputs.isEmpty()) {
-		std::fprintf(stderr, "error: no audio input devices found.\n");
-		return 1;
+	const QAudioDevice def_in = QMediaDevices::defaultAudioInput();
+	std::vector<QAudioDevice> selected_inputs;
+	if (want_inputs) {
+		for (const QAudioDevice &d : inputs) {
+			if (device_matches(d, device_filters, def_in))
+				selected_inputs.push_back(d);
+		}
 	}
 
-	std::vector<QAudioDevice> selected;
-	for (const QAudioDevice &d : inputs) {
-		if (device_matches(d, device_filters))
-			selected.push_back(d);
+	const QList<QAudioDevice> outputs = QMediaDevices::audioOutputs();
+	const QAudioDevice def_out = QMediaDevices::defaultAudioOutput();
+	std::vector<QAudioDevice> selected_sinks;
+	for (const QAudioDevice &d : outputs) {
+		if (sink_matches(d, sink_filters, def_out))
+			selected_sinks.push_back(d);
 	}
-	if (selected.empty()) {
+
+	if (!device_filters.isEmpty() && selected_inputs.empty()) {
 		std::fprintf(stderr,
 			     "error: no input devices matched the given --device filter(s).\n");
+		return 1;
+	}
+	if (!sink_filters.isEmpty() && selected_sinks.empty()) {
+		std::fprintf(stderr,
+			     "error: no output sinks matched the given --sink filter(s). Try --list.\n");
+		return 1;
+	}
+	if (selected_inputs.empty() && selected_sinks.empty()) {
+		std::fprintf(stderr,
+			     "error: no audio sources to capture (no input devices found).\n");
 		return 1;
 	}
 
@@ -253,25 +329,36 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Start a capture per selected device. */
+	/* Start a capture per selected input device. */
 	std::vector<std::unique_ptr<DeviceCapture>> captures;
-	for (const QAudioDevice &d : selected) {
+	for (const QAudioDevice &d : selected_inputs) {
 		auto cap = std::make_unique<DeviceCapture>(d, &engine,
 							   window_seconds);
 		if (cap->start())
 			captures.push_back(std::move(cap));
 	}
 
-	if (captures.empty()) {
+	/* Start a monitor capture per selected output sink (desktop audio). */
+	std::vector<std::unique_ptr<MonitorCapture>> monitors;
+	for (const QAudioDevice &d : selected_sinks) {
+		const QString node = QString::fromUtf8(d.id());
+		auto cap = std::make_unique<MonitorCapture>(
+			node, d.description(), &engine, window_seconds,
+			verbose);
+		if (cap->start())
+			monitors.push_back(std::move(cap));
+	}
+
+	if (captures.empty() && monitors.empty()) {
 		std::fprintf(stderr,
-			     "error: could not start capture on any device.\n");
+			     "error: could not start capture on any source.\n");
 		engine.stop();
 		return 1;
 	}
 
 	wlog(WLOG_INFO,
-	     "[cli] transcribing %zu device(s); press Ctrl-C to stop",
-	     captures.size());
+	     "[cli] transcribing %zu source(s); press Ctrl-C to stop",
+	     captures.size() + monitors.size());
 
 	/* Translate Ctrl-C into a clean Qt event-loop shutdown by polling the
 	 * signal flag (signal handlers must not call into Qt directly). */
@@ -289,6 +376,8 @@ int main(int argc, char *argv[])
 
 	for (auto &cap : captures)
 		cap->stop();
+	for (auto &mon : monitors)
+		mon->stop();
 	engine.stop();
 
 	return rc;
